@@ -68,7 +68,10 @@ var DefBuckets = []float64{.005, .01, .025, .05, .1, .25, .5, 1, 2.5, 5, 10}
 
 // DefSparseBucketsZeroThreshold is the default value for
 // SparseBucketsZeroThreshold in the HistogramOpts.
-var DefSparseBucketsZeroThreshold = 1e-128
+const DefSparseBucketsZeroThreshold = 2.938735877055719e-39
+
+// This is 2^-128 (or 0.5*2^-127 in the actual IEEE 754 representation), which
+// is a bucket boundary at all possible resolutions.
 
 var errBucketLabelNotAllowed = fmt.Errorf(
 	"%q is not allowed as label name in histograms", bucketLabel,
@@ -162,24 +165,41 @@ type HistogramOpts struct {
 	// buckets here explicitly.)
 	Buckets []float64
 
-	// If SparseBucketsResolution is not zero, sparse buckets are used (in
-	// addition to the regular buckets, if defined above). Every power of
-	// ten is divided into the given number of exponential buckets. For
-	// example, if set to 3, the bucket boundaries are approximately […,
-	// 0.1, 0.215, 0.464, 1, 2.15, 4,64, 10, 21.5, 46.4, 100, …] Histograms
-	// can only be properly aggregated if they use the same
-	// resolution. Therefore, it is recommended to use 20 as a resolution,
-	// which is generally expected to be a good tradeoff between resource
-	// usage and accuracy (resulting in a maximum error of quantile values
-	// of about 6%).
-	SparseBucketsResolution uint8
+	// If SparseBucketsFactor is greater than one, sparse buckets are used
+	// (in addition to the regular buckets, if defined above). Sparse
+	// buckets are exponential buckets covering the whole float64 range
+	// (with the exception of the “zero” bucket, see
+	// SparseBucketsZeroThreshold below). From any one bucket to the next,
+	// the width of the bucket grows by a constant factor.
+	// SparseBucketsFactor provides an upper bound for this factor
+	// (exception see below). The smaller SparseBucketsFactor, the more
+	// buckets will be used and thus the more costly the histogram will
+	// become. A generally good trade-off between cost and accuracy is a
+	// value of 1.1 (each bucket is at most 10% wider than the previous
+	// one), which will result in each power of two divided into 8 buckets
+	// (e.g. there will be 8 buckets between 1 and 2, same as between 2 and
+	// 4, and 4 and 8, etc.).
+	//
+	// Details about the actually used factor: The factor is calculated as
+	// 2^(2^n), where n is an integer number between (and including) -8 and
+	// 4. n is chosen so that the resulting factor is the largest that is
+	// still smaller or equal to SparseBucketsFactor. Note that the smallest
+	// possible factor is therefore approx. 1.00271 (i.e. 2^(2^-8) ). If
+	// SparseBucketsFactor is greater than 1 but smaller than 2^(2^-8), then
+	// the actually used factor is still 2^(2^-8) even though it is larger
+	// than the provided SparseBucketsFactor.
+	SparseBucketsFactor float64
 	// All observations with an absolute value of less or equal
 	// SparseBucketsZeroThreshold are accumulated into a “zero” bucket. For
 	// best results, this should be close to a bucket boundary. This is
-	// most easily accomplished by picking a power of ten. If
+	// usually the case if picking a power of two. If
 	// SparseBucketsZeroThreshold is left at zero (or set to a negative
 	// value), DefSparseBucketsZeroThreshold is used as the threshold.
 	SparseBucketsZeroThreshold float64
+	// TODO(beorn7): Need a setting to limit total bucket count and to
+	// configure a strategy to enforce the limit, e.g. if minimum duration
+	// after last reset, reset. If not, half the resolution and/or expand
+	// the zero bucket.
 }
 
 // NewHistogram creates a new Histogram based on the provided HistogramOpts. It
@@ -217,19 +237,23 @@ func newHistogram(desc *Desc, opts HistogramOpts, labelValues ...string) Histogr
 	}
 
 	h := &histogram{
-		desc:             desc,
-		upperBounds:      opts.Buckets,
-		sparseResolution: uint32(opts.SparseBucketsResolution),
-		sparseThreshold:  opts.SparseBucketsZeroThreshold,
-		labelPairs:       MakeLabelPairs(desc, labelValues),
-		counts:           [2]*histogramCounts{{}, {}},
-		now:              time.Now,
+		desc:            desc,
+		upperBounds:     opts.Buckets,
+		sparseThreshold: opts.SparseBucketsZeroThreshold,
+		labelPairs:      MakeLabelPairs(desc, labelValues),
+		counts:          [2]*histogramCounts{{}, {}},
+		now:             time.Now,
 	}
-	if len(h.upperBounds) == 0 && opts.SparseBucketsResolution == 0 {
+	if len(h.upperBounds) == 0 && opts.SparseBucketsFactor <= 1 {
 		h.upperBounds = DefBuckets
 	}
 	if h.sparseThreshold <= 0 {
 		h.sparseThreshold = DefSparseBucketsZeroThreshold
+	}
+	if opts.SparseBucketsFactor <= 1 {
+		h.sparseThreshold = 0 // To mark that there are no sparse buckets.
+	} else {
+		h.sparseSchema = pickSparseSchema(opts.SparseBucketsFactor)
 	}
 	for i, upperBound := range h.upperBounds {
 		if i < len(h.upperBounds)-1 {
@@ -264,14 +288,14 @@ type histogramCounts struct {
 	sumBits uint64
 	count   uint64
 	buckets []uint64
-	// sparse buckets are implemented with a sync.Map for this PoC. A
-	// dedicated data structure will likely be more efficient.
-	// There are separate maps for negative and positive observations.
-	// The map's value is a *uint64, counting observations in that bucket.
-	// The map's key is the logarithmic index of the bucket. Index 0 is for an
-	// upper bound of 1. Each increment/decrement by SparseBucketsResolution
-	// multiplies/divides the upper bound by 10. Indices in between are
-	// spaced exponentially as defined in spareBounds.
+	// sparse buckets are implemented with a sync.Map for now. A dedicated
+	// data structure will likely be more efficient. There are separate maps
+	// for negative and positive observations. The map's value is an *int64,
+	// counting observations in that bucket. (Note that we don't use uint64
+	// as an int64 won't overflow in practice, and working with signed
+	// numbers from the beginning simplifies the handling of deltas.) The
+	// map's key is the index of the bucket according to the used
+	// sparseSchema. Index 0 is for an upper bound of 1.
 	sparseBucketsPositive, sparseBucketsNegative sync.Map
 	// sparseZeroBucket counts all (positive and negative) observations in
 	// the zero bucket (with an absolute value less or equal
@@ -312,10 +336,10 @@ func (hc *histogramCounts) observe(v float64, bucket int, doSparse bool, whichSp
 	atomic.AddUint64(&hc.count, 1)
 }
 
-func addToSparseBucket(buckets *sync.Map, key int, increment uint64) {
+func addToSparseBucket(buckets *sync.Map, key int, increment int64) {
 	if existingBucket, ok := buckets.Load(key); ok {
 		// Fast path without allocation.
-		atomic.AddUint64(existingBucket.(*uint64), increment)
+		atomic.AddInt64(existingBucket.(*int64), increment)
 		return
 	}
 	// Bucket doesn't exist yet. Slow path allocating new counter.
@@ -323,7 +347,7 @@ func addToSparseBucket(buckets *sync.Map, key int, increment uint64) {
 	if actualBucket, loaded := buckets.LoadOrStore(key, &newBucket); loaded {
 		// The bucket was created concurrently in another goroutine.
 		// Have to increment after all.
-		atomic.AddUint64(actualBucket.(*uint64), increment)
+		atomic.AddInt64(actualBucket.(*int64), increment)
 	}
 }
 
@@ -339,7 +363,7 @@ type histogram struct {
 	// perspective of the histogram) swap the hot–cold under the writeMtx
 	// lock. A cooldown is awaited (while locked) by comparing the number of
 	// observations with the initiation count. Once they match, then the
-	// last observation on the now cool one has completed. All cool fields must
+	// last observation on the now cool one has completed. All cold fields must
 	// be merged into the new hot before releasing writeMtx.
 	//
 	// Fields with atomic access first! See alignment constraint:
@@ -356,11 +380,12 @@ type histogram struct {
 	// http://golang.org/pkg/sync/atomic/#pkg-note-BUG.
 	counts [2]*histogramCounts
 
-	upperBounds      []float64
-	labelPairs       []*dto.LabelPair
-	exemplars        []atomic.Value // One more than buckets (to include +Inf), each a *dto.Exemplar.
-	sparseResolution uint32         // Instead of uint8 to be ready for protobuf encoding.
-	sparseThreshold  float64
+	upperBounds     []float64
+	labelPairs      []*dto.LabelPair
+	exemplars       []atomic.Value // One more than buckets (to include +Inf), each a *dto.Exemplar.
+	sparseSchema    int32
+	sparseThreshold float64   // This is zero iff no sparse buckets are used.
+	sparseBounds    []float64 // Bounds for frac as returned by math.Frexp(observation).
 
 	now func() time.Time // To mock out time.Now() for testing.
 }
@@ -407,7 +432,7 @@ func (h *histogram) Write(out *dto.Metric) error {
 		Bucket:          make([]*dto.Bucket, len(h.upperBounds)),
 		SampleCount:     proto.Uint64(count),
 		SampleSum:       proto.Float64(math.Float64frombits(atomic.LoadUint64(&coldCounts.sumBits))),
-		SbResolution:    &h.sparseResolution,
+		SbSchema:        &h.sparseSchema,
 		SbZeroThreshold: &h.sparseThreshold,
 	}
 	out.Histogram = his
@@ -448,7 +473,7 @@ func (h *histogram) Write(out *dto.Metric) error {
 		atomic.AddUint64(&hotCounts.buckets[i], atomic.LoadUint64(&coldCounts.buckets[i]))
 		atomic.StoreUint64(&coldCounts.buckets[i], 0)
 	}
-	if h.sparseResolution != 0 {
+	if h.sparseThreshold != 0 {
 		zeroBucket := atomic.LoadUint64(&coldCounts.sparseZeroBucket)
 
 		defer func() {
@@ -478,21 +503,41 @@ func makeSparseBuckets(buckets *sync.Map) *dto.SparseBuckets {
 	}
 
 	sbs := dto.SparseBuckets{}
-	var prevCount uint64
+	var prevCount int64
 	var nextI int
+
+	appendDelta := func(count int64) {
+		*sbs.Span[len(sbs.Span)-1].Length++
+		sbs.Delta = append(sbs.Delta, count-prevCount)
+		prevCount = count
+	}
+
 	for n, i := range ii {
 		v, _ := buckets.Load(i)
-		count := atomic.LoadUint64(v.(*uint64))
-		if n == 0 || i-nextI != 0 {
+		count := atomic.LoadInt64(v.(*int64))
+		// Multiple spans with only small gaps in between are probably
+		// encoded more efficiently as one larger span with a few empty
+		// buckets. Needs some research to find the sweet spot. For now,
+		// we assume that gaps of one ore two buckets should not create
+		// a new span.
+		iDelta := int32(i - nextI)
+		if n == 0 || iDelta > 2 {
+			// We have to create a new span, either because we are
+			// at the very beginning, or because we have found a gap
+			// of more than two buckets.
 			sbs.Span = append(sbs.Span, &dto.SparseBuckets_Span{
-				Offset: proto.Int32(int32(i - nextI)),
-				Length: proto.Uint32(1),
+				Offset: proto.Int32(iDelta),
+				Length: proto.Uint32(0),
 			})
 		} else {
-			*sbs.Span[len(sbs.Span)-1].Length++
+			// We have found a small gap (or no gap at all).
+			// Insert empty buckets as needed.
+			for j := int32(0); j < iDelta; j++ {
+				appendDelta(0)
+			}
 		}
-		sbs.Delta = append(sbs.Delta, int64(count)-int64(prevCount)) // TODO(beorn7): Do proper overflow handling.
-		nextI, prevCount = i+1, count
+		appendDelta(count)
+		nextI = i + 1
 	}
 	return &sbs
 }
@@ -504,9 +549,9 @@ func makeSparseBuckets(buckets *sync.Map) *dto.SparseBuckets {
 // recreated on the next scrape).
 func addAndReset(hotBuckets *sync.Map) func(k, v interface{}) bool {
 	return func(k, v interface{}) bool {
-		bucket := v.(*uint64)
-		addToSparseBucket(hotBuckets, k.(int), atomic.LoadUint64(bucket))
-		atomic.StoreUint64(bucket, 0)
+		bucket := v.(*int64)
+		addToSparseBucket(hotBuckets, k.(int), atomic.LoadInt64(bucket))
+		atomic.StoreInt64(bucket, 0)
 		return true
 	}
 }
@@ -528,7 +573,7 @@ func (h *histogram) findBucket(v float64) int {
 
 // observe is the implementation for Observe without the findBucket part.
 func (h *histogram) observe(v float64, bucket int) {
-	doSparse := h.sparseResolution != 0
+	doSparse := h.sparseThreshold != 0
 	var whichSparse, sparseKey int
 	if doSparse {
 		switch {
@@ -537,13 +582,17 @@ func (h *histogram) observe(v float64, bucket int) {
 		case v < -h.sparseThreshold:
 			whichSparse = -1
 		}
-		// TODO(beorn7): This sometimes gives inaccurate results for
-		// floats that are actual powers of 10, e.g. math.Log10(0.1) is
-		// calculated as -0.9999999999999999 rather than -1 and thus
-		// yields a key unexpectedly one off. Maybe special-case precise
-		// powers of 10.
 		// TODO(beorn7): This needs special-casing for ±Inf and NaN.
-		sparseKey = int(math.Ceil(math.Log10(math.Abs(v)) * float64(h.sparseResolution)))
+		frac, exp := math.Frexp(math.Abs(v))
+		if h.sparseSchema > 0 {
+			sparseKey = sort.SearchFloat64s(h.sparseBounds, frac) + (exp-1)*len(h.sparseBounds)
+		} else {
+			sparseKey = exp
+			if frac == 0.5 {
+				sparseKey--
+			}
+			sparseKey /= 1 << -h.sparseSchema
+		}
 	}
 	// We increment h.countAndHotIdx so that the counter in the lower
 	// 63 bits gets incremented. At the same time, we get the new value
@@ -796,4 +845,26 @@ func (s buckSort) Swap(i, j int) {
 
 func (s buckSort) Less(i, j int) bool {
 	return s[i].GetUpperBound() < s[j].GetUpperBound()
+}
+
+// pickSparseschema returns the largest number n between -4 and 8 such that
+// 2^(2^-n) is less or equal the provided bucketFactor.
+//
+// Special cases:
+//     - bucketFactor <= 1: panics.
+//     - bucketFactor < 2^(2^-8) (but > 1): still returns 8.
+func pickSparseSchema(bucketFactor float64) int32 {
+	if bucketFactor <= 1 {
+		panic(fmt.Errorf("bucketFactor %f is <=1", bucketFactor))
+	}
+	floor := math.Floor(math.Log2(math.Log2(bucketFactor)))
+	switch {
+	case floor <= -8:
+		return 8
+	case floor >= 4:
+		return -4
+	default:
+		return -int32(floor)
+	}
+	// TODO(beorn7): Also calculate and return sparseBounds.
 }
